@@ -50,6 +50,9 @@ class NodeEvent:
     parts: tuple[str, ...]
     entry_type: str  # "file" | "dir" | "symlink"
     link_target: str | None
+    # 普通文件的 tar 元数据逻辑大小（字节）；目录/软链接为 0。
+    # 供层占用统计使用，合并视图本身不关心内容大小。
+    size: int = 0
 
 
 LayerEvent = OpaqueEvent | WhiteoutEvent | NodeEvent
@@ -137,12 +140,15 @@ def load_layer(data: bytes, layer_index: int, display_name: str = "") -> list[La
                 if member.isdir():
                     entry_type = "dir"
                     link_target = None
+                    size = 0
                 elif member.isreg():
                     entry_type = "file"
                     link_target = None
+                    size = member.size
                 elif member.issym():
                     entry_type = "symlink"
                     link_target = member.linkname or ""
+                    size = 0
                     if "\x00" in link_target:
                         raise InvalidInputError(
                             f"{label} 软链接目标含 NUL 字节: {member.name}"
@@ -157,7 +163,12 @@ def load_layer(data: bytes, layer_index: int, display_name: str = "") -> list[La
                     )
 
                 events.append(
-                    NodeEvent(parts=parts, entry_type=entry_type, link_target=link_target)
+                    NodeEvent(
+                        parts=parts,
+                        entry_type=entry_type,
+                        link_target=link_target,
+                        size=size,
+                    )
                 )
             return events
     except tarfile.ReadError as exc:

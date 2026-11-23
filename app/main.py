@@ -7,6 +7,11 @@ POST /api/troubleshoot：
   * 提交 ``mount_points``（JSON 字符串数组）与 ``volume_entries``
     （JSON 对象：挂载点 -> 卷内条目清单）；
   * 分别返回「挂载前（纯镜像叠加视图）」与「挂载后（卷遮蔽挂载点）」的查找结果。
+
+POST /api/layer-usage：
+  * 同样的底到顶层上传；
+  * 提交待查的容器内绝对目录 ``target_dir``（不必在当前镜像里存在）；
+  * 按归档路径统计该目录下普通文件的写入 / 最终可见 / 被后层首次遮蔽的字节数。
 """
 
 from __future__ import annotations
@@ -21,7 +26,8 @@ from pydantic import BaseModel, Field
 from .errors import InvalidInputError, TroubleshootError
 from .imagefs import build_image_tree, normalize_absolute, validate_mount_points
 from .resolver import ContainerView, ResolveResult, resolve
-from .tarloader import load_layer
+from .tarloader import LayerEvent, load_layer
+from .usage import UsageReport, compute_usage
 from .volume import VolumeTree, build_volume_tree
 
 MAX_LAYER_BYTES = 128 * 1024 * 1024  # 单层 128 MiB
@@ -32,9 +38,10 @@ app = FastAPI(
     description=(
         "按底到顶上传未压缩 OCI 层 tar，模拟 whiteout / 不透明目录叠加、"
         "卷挂载遮蔽、软链接（可跨挂载点，成环报错）解析，"
-        "对比挂载前后的路径查找结果。"
+        "对比挂载前后的路径查找结果；并提供按目录统计各层占用 / 遮蔽字节数的"
+        "镜像体积诊断。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -79,6 +86,39 @@ class TroubleshootResponse(BaseModel):
     after_mount: LookupOutcome = Field(description="挂载后：挂载点被卷遮蔽后的查找结果")
 
 
+class LayerShadowEntry(BaseModel):
+    layer_index: int = Field(description="首次遮蔽该层写入的后层索引（越大越靠上）")
+    layer_name: str = Field(description="遮蔽层上传时的文件名")
+    bytes: int = Field(description="被该后层遮蔽的字节数")
+
+
+class LayerUsageEntry(BaseModel):
+    layer_index: int = Field(description="写入层索引，0 为最底层")
+    layer_name: str = Field(description="写入层上传时的文件名")
+    written_bytes: int = Field(description="该层在目标目录下写入的普通文件总字节数")
+    visible_bytes: int = Field(description="其中最终仍可见的字节数（扣除被后层遮蔽）")
+    shadowed_bytes: int = Field(description="其中被后续层首次遮蔽掉的字节数")
+    shadowed_by: dict[str, int] = Field(
+        default_factory=dict,
+        description="后层索引（字符串键）-> 被该后层首次遮蔽的字节数；只记首次遮蔽",
+    )
+    shadowed_by_layers: list[LayerShadowEntry] = Field(
+        default_factory=list,
+        description="与 shadowed_by 相同归因的明细列表（含遮蔽层文件名）",
+    )
+
+
+class LayerUsageResponse(BaseModel):
+    target_dir: str = Field(description="统计的容器内绝对目录（规范化后）")
+    layer_count: int
+    layers: list[LayerUsageEntry] = Field(
+        description="按底到顶每个写入层的统计；没有写入的层也会列出（各项为 0）"
+    )
+    total_written_bytes: int = Field(description="所有层写入合计")
+    total_visible_bytes: int = Field(description="最终可见合计")
+    total_shadowed_bytes: int = Field(description="被后层遮蔽合计")
+
+
 @app.exception_handler(TroubleshootError)
 async def _troubleshoot_error_handler(_: Request, exc: TroubleshootError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
@@ -117,6 +157,25 @@ def _result_to_dict(result: ResolveResult) -> dict:
     }
 
 
+async def _read_layers(layers: list[UploadFile]) -> tuple[list[list[LayerEvent]], list[str]]:
+    """读入并逐层解析 tar（保留上传顺序：底 -> 顶），返回事件与显示名。"""
+
+    total_bytes = 0
+    layer_events: list[list[LayerEvent]] = []
+    layer_names: list[str] = []
+    for index, upload in enumerate(layers):
+        data = await upload.read()
+        total_bytes += len(data)
+        if len(data) > MAX_LAYER_BYTES:
+            raise InvalidInputError(f"第 {index} 层超过 128MiB 单层上限")
+        if total_bytes > MAX_TOTAL_BYTES:
+            raise InvalidInputError("全部层合计超过 384MiB 上限")
+        name = upload.filename or f"layer[{index}]"
+        layer_events.append(load_layer(data, index, name))
+        layer_names.append(name)
+    return layer_events, layer_names
+
+
 @app.post(
     "/api/troubleshoot",
     response_model=TroubleshootResponse,
@@ -147,17 +206,7 @@ async def troubleshoot(
     if not layers:
         raise InvalidInputError("至少需要上传一个 OCI 层 tar（layers 字段）")
 
-    total_bytes = 0
-    layer_events = []
-    for index, upload in enumerate(layers):
-        data = await upload.read()
-        total_bytes += len(data)
-        if len(data) > MAX_LAYER_BYTES:
-            raise InvalidInputError(f"第 {index} 层超过 128MiB 单层上限")
-        if total_bytes > MAX_TOTAL_BYTES:
-            raise InvalidInputError("全部层合计超过 384MiB 上限")
-        name = upload.filename or f"layer[{index}]"
-        layer_events.append(load_layer(data, index, name))
+    layer_events, layer_names = await _read_layers(layers)
 
     # 2) 合并镜像层
     tree = build_image_tree(layer_events)
@@ -227,3 +276,75 @@ async def troubleshoot(
 
 def _join_parts(parts: tuple[str, ...]) -> str:
     return "/" + "/".join(parts) if parts else "/"
+
+
+@app.post(
+    "/api/layer-usage",
+    response_model=LayerUsageResponse,
+    tags=["占用诊断"],
+    summary="按目录统计各层写入 / 最终可见 / 被后层首次遮蔽的字节数",
+)
+async def layer_usage(
+    layers: list[UploadFile] = File(
+        description=(
+            "未压缩 OCI 层 tar 文件，multipart 顺序必须是从最底层到最顶层；"
+            "接口只读取 tar 条目元数据（归档路径、类型、普通文件 size），"
+            "不提取任何文件内容。"
+        )
+    ),
+    target_dir: Optional[str] = Form(
+        default=None,
+        description=(
+            "要统计的容器内绝对目录，如 /opt/app 或 /；按归档路径前缀匹配，"
+            "目录本身不必在当前镜像里存在（已经删掉的历史目录同样可以统计）"
+        ),
+    ),
+    target_path: Optional[str] = Form(
+        default=None,
+        description="target_dir 的等价别名（与既有排障接口的字段命名保持一致），二选一",
+    ),
+) -> LayerUsageResponse:
+    if not layers:
+        raise InvalidInputError("至少需要上传一个 OCI 层 tar（layers 字段）")
+
+    if target_dir and target_path and target_dir != target_path:
+        raise InvalidInputError("target_dir 与 target_path 同时提交且不一致，请只提交一个")
+    raw_target = target_dir or target_path
+    if raw_target is None or not raw_target.strip():
+        raise InvalidInputError("必须提交要统计的绝对目录（target_dir）")
+
+    target_parts = normalize_absolute(raw_target, "target_dir")
+
+    layer_events, layer_names = await _read_layers(layers)
+    report = compute_usage(layer_events, target_parts, layer_names)
+    return _usage_to_response(report)
+
+
+def _usage_to_response(report: UsageReport) -> LayerUsageResponse:
+    return LayerUsageResponse(
+        target_dir=_join_parts(report.target_parts),
+        layer_count=len(report.layers),
+        layers=[
+            LayerUsageEntry(
+                layer_index=item.layer_index,
+                layer_name=item.layer_name,
+                written_bytes=item.written_bytes,
+                visible_bytes=item.visible_bytes,
+                shadowed_bytes=item.shadowed_bytes,
+                shadowed_by={str(shadower): amount for shadower, amount in sorted(item.shadowed_by.items())},
+                shadowed_by_layers=[
+                    LayerShadowEntry(
+                        layer_index=shadower,
+                        # 遮蔽层一定存在（索引来自同一个 layers 列表）。
+                        layer_name=report.layers[shadower].layer_name,
+                        bytes=amount,
+                    )
+                    for shadower, amount in sorted(item.shadowed_by.items())
+                ],
+            )
+            for item in report.layers
+        ],
+        total_written_bytes=report.total_written_bytes,
+        total_visible_bytes=report.total_visible_bytes,
+        total_shadowed_bytes=report.total_shadowed_bytes,
+    )

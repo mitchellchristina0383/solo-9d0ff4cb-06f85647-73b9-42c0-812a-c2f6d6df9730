@@ -24,6 +24,8 @@ class Node:
     entry_type: str  # "file" | "dir" | "symlink"
     layer_index: int  # 来源层：0 为最底层
     link_target: str | None = None
+    # 普通文件的 tar 元数据大小；目录 / 软链接为 0。
+    size: int = 0
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,7 @@ def build_image_tree(layers: list[list[LayerEvent]]) -> ImageTree:
                 entry_type=event.entry_type,
                 layer_index=layer_index,
                 link_target=event.link_target,
+                size=event.size,
             )
             old = entries.get(event.parts)
             if old is not None and event.entry_type != "dir":
